@@ -1,4 +1,5 @@
 import io
+import os
 import json
 import base64
 import html
@@ -8,15 +9,19 @@ import streamlit as st
 from PIL import Image
 
 try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
+
+try:
     import qrcode
 except ImportError:
     qrcode = None
 
 try:
-    from conexion import conectar
+    from conexion import conectar as conectar_local
 except ImportError:
-    def conectar():
-        return None
+    conectar_local = None
 
 # =====================================================
 # 1. CONFIGURACIÓN GENERAL Y CARGA DE LOGOTIPO NATIVO
@@ -244,7 +249,7 @@ div[data-baseweb="select"] *, div[data-baseweb="popover"] *, div[data-baseweb="m
 ''', unsafe_allow_html=True)
 
 # =====================================================
-# 3. PERSISTENCIA EN MEMORIA Y BASE DE DATOS
+# 3. PERSISTENCIA EN MEMORIA Y BASE DE DATOS EN LA NUBE
 # =====================================================
 
 def init_session_state():
@@ -324,13 +329,49 @@ def init_session_state():
                 },
             ],
             "firmas": [
-                {"id_firma": 1, "id_hoja_ruta": 1, "id_validacion": 1, "token_hash": "CERT-PREV-001", "fecha_firma": "2026-11-02 10:30:00"}
+                {"id_firma": 1, "id_hoja_ruta": 1, "id_validacion": 1, "token_hash": "CERT-PREVENCION-HR-001", "fecha_firma": "2026-11-02 10:30:00"}
             ],
             "seguimientos": [],
             "pagos": []
         }
 
 init_session_state()
+
+def limpiar_db_url(raw_url):
+    if not raw_url:
+        return None
+    url = str(raw_url).strip()
+    if url.startswith("psql "):
+        url = url[5:].strip()
+    url = url.strip("'\"")
+    if "&channel_binding=require" in url:
+        url = url.replace("&channel_binding=require", "")
+    return url
+
+def conectar():
+    db_url = None
+    try:
+        if "DATABASE_URL" in st.secrets:
+            db_url = st.secrets["DATABASE_URL"]
+    except Exception:
+        pass
+
+    if not db_url:
+        db_url = os.environ.get("DATABASE_URL")
+
+    db_url = limpiar_db_url(db_url)
+
+    if db_url and psycopg2 is not None:
+        try:
+            return psycopg2.connect(db_url)
+        except Exception as e:
+            st.session_state["ultimo_error_bd"] = f"Error de conexión a Neon: {e}"
+            return None
+
+    if conectar_local is not None:
+        return conectar_local()
+
+    return None
 
 def db_consultar(sql, params=None):
     conn = conectar()
@@ -342,8 +383,10 @@ def db_consultar(sql, params=None):
             res = [dict(zip(cols, row)) for row in cursor.fetchall()]
             cursor.close()
             conn.close()
+            st.session_state["ultimo_error_bd"] = None
             return res
-        except Exception:
+        except Exception as e:
+            st.session_state["ultimo_error_bd"] = f"Error SQL al consultar: {e}"
             conn.close()
     return None
 
@@ -356,8 +399,10 @@ def db_ejecutar(sql, params=None):
             conn.commit()
             cursor.close()
             conn.close()
+            st.session_state["ultimo_error_bd"] = None
             return True
-        except Exception:
+        except Exception as e:
+            st.session_state["ultimo_error_bd"] = f"Error SQL al guardar: {e}"
             conn.rollback()
             conn.close()
     return False
@@ -466,15 +511,17 @@ def pagina_dashboard(user):
             st.rerun()
 
     hojas = db_consultar("SELECT h.*, s.nombre as subcontratista FROM hoja_ruta h JOIN subcontratista s ON h.id_subcontratista = s.id_subcontratista ORDER BY h.id_hoja_ruta DESC;")
-    if not hojas:
+    if hojas is None:
+        if st.session_state.get("ultimo_error_bd"):
+            st.error(st.session_state["ultimo_error_bd"])
         hojas = st.session_state["db_mock"]["hojas"]
 
     validaciones = db_consultar("SELECT * FROM validacion_area;")
-    if not validaciones:
+    if validaciones is None:
         validaciones = st.session_state["db_mock"]["validaciones"]
 
     firmas = db_consultar("SELECT * FROM firma_qr;")
-    if not firmas:
+    if firmas is None:
         firmas = st.session_state["db_mock"]["firmas"]
 
     with st.container(border=True):
@@ -554,11 +601,13 @@ def pagina_mis_validaciones(user):
             st.rerun()
 
     hojas = db_consultar("SELECT h.*, s.nombre as subcontratista FROM hoja_ruta h JOIN subcontratista s ON h.id_subcontratista = s.id_subcontratista ORDER BY h.id_hoja_ruta DESC;")
-    if not hojas:
+    if hojas is None:
+        if st.session_state.get("ultimo_error_bd"):
+            st.error(st.session_state["ultimo_error_bd"])
         hojas = st.session_state["db_mock"]["hojas"]
 
     validaciones_todas = db_consultar("SELECT * FROM validacion_area WHERE area = %s;", (rol_area,))
-    if not validaciones_todas:
+    if validaciones_todas is None:
         validaciones_todas = [v for v in st.session_state["db_mock"]["validaciones"] if v["area"] == rol_area]
 
     if not hojas:
@@ -642,27 +691,46 @@ def pagina_mis_validaciones(user):
                 raw_token = f"HDR:{hoja_sel['codigo']}|AREA:{rol_area}|USER:{user.get('rut')}|TS:{timestamp}"
                 qr_b64 = generar_qr_base64(raw_token)
                 tarea_desc = f"Auditoría exclusiva de {rol_area} completada para especialidad {esp_actual}."
+                token_corto = f"CERT-{rol_area.upper()}-{hoja_sel['codigo']}"
 
                 if val_actual:
-                    db_ejecutar("UPDATE validacion_area SET estado_validacion = %s, comentario = %s, fecha_actualizacion = CURRENT_TIMESTAMP, id_usuario_validador = %s WHERE id_validacion = %s;", (nuevo_estado, nuevo_comentario.strip(), user.get('id_usuario'), val_actual['id_validacion']))
+                    db_ejecutar("UPDATE validacion_area SET estado_validacion = %s, tarea = %s, comentario = %s, fecha_actualizacion = CURRENT_TIMESTAMP, id_usuario_validador = %s WHERE id_validacion = %s;", (nuevo_estado, tarea_desc, nuevo_comentario.strip(), user.get('id_usuario'), val_actual['id_validacion']))
                     val_actual["estado_validacion"] = nuevo_estado
                     val_actual["comentario"] = nuevo_comentario.strip()
                     val_actual["tarea"] = tarea_desc
+                    id_val_ref = val_actual['id_validacion']
                 else:
-                    db_ejecutar("INSERT INTO validacion_area (id_hoja_ruta, area, estado_validacion, comentario, id_usuario_validador) VALUES (%s, %s, %s, %s, %s);", (hoja_sel['id_hoja_ruta'], rol_area, nuevo_estado, nuevo_comentario.strip(), user.get('id_usuario')))
+                    db_ejecutar("INSERT INTO validacion_area (id_hoja_ruta, area, estado_validacion, tarea, comentario, id_usuario_validador) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (id_hoja_ruta, area) DO UPDATE SET estado_validacion = EXCLUDED.estado_validacion, comentario = EXCLUDED.comentario, fecha_actualizacion = CURRENT_TIMESTAMP;", (hoja_sel['id_hoja_ruta'], rol_area, nuevo_estado, tarea_desc, nuevo_comentario.strip(), user.get('id_usuario')))
+                    creada_v = db_consultar("SELECT id_validacion FROM validacion_area WHERE id_hoja_ruta = %s AND area = %s ORDER BY id_validacion DESC LIMIT 1;", (hoja_sel['id_hoja_ruta'], rol_area))
+                    id_val_ref = creada_v[0]["id_validacion"] if creada_v else None
+
+                if nuevo_estado == "Aprobado" and id_val_ref is not None:
+                    db_ejecutar(
+                        """
+                        INSERT INTO firma_qr (id_hoja_ruta, id_validacion, token_hash, codigo_qr_base64)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (token_hash) DO UPDATE
+                        SET codigo_qr_base64 = EXCLUDED.codigo_qr_base64,
+                            fecha_firma = CURRENT_TIMESTAMP;
+                        """,
+                        (hoja_sel['id_hoja_ruta'], id_val_ref, token_corto, qr_b64)
+                    )
 
                 st.session_state["db_mock"]["firmas"].append({
                     "id_firma": len(st.session_state["db_mock"]["firmas"]) + 1,
                     "id_hoja_ruta": hoja_sel['id_hoja_ruta'],
-                    "token_hash": f"CERT-{rol_area.upper()}-001",
+                    "token_hash": token_corto,
                     "codigo_qr_base64": qr_b64,
                     "fecha_firma": timestamp
                 })
 
                 db_ejecutar("INSERT INTO seguimiento (estado_registrado, comentario, id_hoja_ruta, id_usuario) VALUES (%s, %s, %s, %s);", (f"{nuevo_estado} ({rol_area})", nuevo_comentario.strip(), hoja_sel["id_hoja_ruta"], user.get("id_usuario")))
 
-                st.success(f"¡Evaluación registrada por {rol_area}! Se generó la Firma QR de validación.")
-                st.rerun()
+                if st.session_state.get("ultimo_error_bd"):
+                    st.error(st.session_state["ultimo_error_bd"])
+                else:
+                    st.success(f"¡Evaluación registrada por {rol_area}! Se generó la Firma QR de validación.")
+                    st.rerun()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -689,11 +757,11 @@ def pagina_cursar_ep(user):
     ''', unsafe_allow_html=True)
 
     hojas = db_consultar("SELECT h.*, s.nombre as subcontratista FROM hoja_ruta h JOIN subcontratista s ON h.id_subcontratista = s.id_subcontratista ORDER BY h.id_hoja_ruta DESC;")
-    if not hojas:
+    if hojas is None:
         hojas = st.session_state["db_mock"]["hojas"]
 
     validaciones = db_consultar("SELECT * FROM validacion_area;")
-    if not validaciones:
+    if validaciones is None:
         validaciones = st.session_state["db_mock"]["validaciones"]
 
     for h in hojas:
@@ -715,7 +783,7 @@ def pagina_cursar_ep(user):
                     st.success("✅ Habilitada para EP")
                     if st.button(f"Cursar EP para {h['codigo']}", key=f"btn_ep_{h['id_hoja_ruta']}"):
                         cod_ep = f"EP-00{h['id_hoja_ruta']}"
-                        db_ejecutar("INSERT INTO estado_pago (codigo, fecha_emision, estado_tramitacion, monto, id_hoja_ruta) VALUES (%s, CURRENT_DATE, %s, %s, %s);", (cod_ep, "Aprobado", 2500000.00, h['id_hoja_ruta']))
+                        db_ejecutar("INSERT INTO estado_pago (codigo, fecha_emision, estado_tramitacion, monto, id_hoja_ruta) VALUES (%s, CURRENT_DATE, %s, %s, %s) ON CONFLICT (codigo) DO UPDATE SET estado_tramitacion = EXCLUDED.estado_tramitacion, fecha_emision = CURRENT_DATE;", (cod_ep, "Aprobado", 2500000.00, h['id_hoja_ruta']))
                         db_ejecutar("UPDATE hoja_ruta SET estado_actual = 'Lista para EP' WHERE id_hoja_ruta = %s;", (h['id_hoja_ruta'],))
                         db_ejecutar("INSERT INTO seguimiento (estado_registrado, comentario, id_hoja_ruta, id_usuario) VALUES (%s, %s, %s, %s);", ("Lista para EP", f"Estado de Pago {cod_ep} cursado tras completar el 100% de las validaciones.", h["id_hoja_ruta"], user.get("id_usuario")))
                         st.session_state["db_mock"]["pagos"].append({
@@ -736,7 +804,7 @@ def pagina_cursar_ep(user):
 def pagina_hojas(user):
     st.markdown("<h1 style='color:#1F2328;'>Listado General de Hojas de Ruta</h1>", unsafe_allow_html=True)
     hojas = db_consultar("SELECT h.*, s.nombre as subcontratista FROM hoja_ruta h JOIN subcontratista s ON h.id_subcontratista = s.id_subcontratista ORDER BY h.id_hoja_ruta DESC;")
-    if not hojas:
+    if hojas is None:
         hojas = st.session_state["db_mock"]["hojas"]
 
     st.dataframe(hojas, use_container_width=True)
@@ -745,7 +813,9 @@ def pagina_nueva_hoja(user):
     st.markdown("<h1 style='color:#1F2328;'>Registrar Nueva Hoja de Ruta — Asistente Técnico (AT)</h1>", unsafe_allow_html=True)
 
     subcontratistas = db_consultar("SELECT * FROM subcontratista;")
-    if not subcontratistas:
+    if subcontratistas is None:
+        if st.session_state.get("ultimo_error_bd"):
+            st.error(st.session_state["ultimo_error_bd"])
         subcontratistas = st.session_state["db_mock"]["subcontratistas"]
 
     hojas_actuales = db_consultar("SELECT id_hoja_ruta FROM hoja_ruta;")
@@ -769,10 +839,13 @@ def pagina_nueva_hoja(user):
                         "rut": sub_rut.strip(),
                         "contacto": sub_cnt.strip()
                     }
-                    db_ejecutar("INSERT INTO subcontratista (nombre, rut, contacto) VALUES (%s, %s, %s);", (sub_nom.strip(), sub_rut.strip(), sub_cnt.strip()))
+                    ok_sub = db_ejecutar("INSERT INTO subcontratista (nombre, rut, contacto) VALUES (%s, %s, %s) ON CONFLICT (rut) DO NOTHING;", (sub_nom.strip(), sub_rut.strip(), sub_cnt.strip()))
                     st.session_state["db_mock"]["subcontratistas"].append(nuevo_item)
-                    st.success(f"¡Empresa '{sub_nom.strip()}' registrada! Ya puedes seleccionarla en el formulario.")
-                    st.rerun()
+                    if not ok_sub and st.session_state.get("ultimo_error_bd"):
+                        st.error(st.session_state["ultimo_error_bd"])
+                    else:
+                        st.success(f"¡Empresa '{sub_nom.strip()}' registrada! Ya puedes seleccionarla en el formulario.")
+                        st.rerun()
 
     st.markdown("---")
 
@@ -800,7 +873,6 @@ def pagina_nueva_hoja(user):
             elif not sub_sel:
                 st.error("Selecciona un subcontratista.")
             else:
-                db_ejecutar("ALTER TABLE hoja_ruta ADD COLUMN IF NOT EXISTS especialidad VARCHAR(120) DEFAULT 'Obras Civiles / Hormigones';")
                 insertado_bd = db_ejecutar(
                     "INSERT INTO hoja_ruta (codigo, proyecto, especialidad, id_subcontratista) VALUES (%s, %s, %s, %s);",
                     (cod.strip(), proy.strip(), especialidad_sel, sub_sel["id_subcontratista"])
@@ -828,8 +900,8 @@ def pagina_nueva_hoja(user):
                 for area in ["Prevencion", "Calidad", "Finanzas"]:
                     tarea_ini = f"Auditoría técnica de {area} para la especialidad {especialidad_sel}."
                     db_ejecutar(
-                        "INSERT INTO validacion_area (id_hoja_ruta, area, estado_validacion, comentario) VALUES (%s, %s, %s, %s);",
-                        (new_id, area, "Pendiente", "Revisión asignada automáticamente.")
+                        "INSERT INTO validacion_area (id_hoja_ruta, area, estado_validacion, tarea, comentario) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id_hoja_ruta, area) DO NOTHING;",
+                        (new_id, area, "Pendiente", tarea_ini, "Revisión asignada automáticamente.")
                     )
                     st.session_state["db_mock"]["validaciones"].append({
                         "id_validacion": len(st.session_state["db_mock"]["validaciones"]) + 1,
@@ -842,7 +914,10 @@ def pagina_nueva_hoja(user):
                         "fecha_actualizacion": str(datetime.now())
                     })
 
-                st.success(f"Hoja de Ruta {cod} registrada correctamente con especialidad '{especialidad_sel}' y puesta a disposición de las áreas.")
+                if not insertado_bd and st.session_state.get("ultimo_error_bd"):
+                    st.error(st.session_state["ultimo_error_bd"])
+                else:
+                    st.success(f"Hoja de Ruta {cod} registrada correctamente con especialidad '{especialidad_sel}' y puesta a disposición de las áreas.")
 
 # =====================================================
 # 5. CONTROL DE FLUJO Y SEGURIDAD ESTRICTA POR ROL
